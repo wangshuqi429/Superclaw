@@ -471,7 +471,7 @@ def build() -> None:
         topMargin=TOP,
         bottomMargin=BOTTOM,
         title="Superclaw PR Reviewer 知识库",
-        author="Superclaw Team",
+        author="AgentProject",
         subject="Superclaw 项目知识库",
     )
     document.build(story, onFirstPage=footer, onLaterPages=footer)

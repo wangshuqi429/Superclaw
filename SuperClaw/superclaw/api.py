@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict
 
-from superclaw.config import Settings
+from .config import Settings
 from .auth import Principal
 from .github import verify_signature
 from .metrics import metrics
@@ -23,6 +23,10 @@ FEEDBACK = re.compile(r"^/v1/tasks/([0-9a-f-]+)/feedback$")
 CANCEL = re.compile(r"^/v1/tasks/([0-9a-f-]+)/cancel$")
 RESUME = re.compile(r"^/v1/tasks/([0-9a-f-]+)/resume$")
 ROLLBACK = re.compile(r"^/v1/skills/([A-Za-z0-9_-]+)/versions/(\d+)/activate$")
+SKILL_ARTIFACT_VERSIONS = re.compile(r"^/v1/skill-evolution/([a-z0-9_-]+)/versions$")
+SKILL_ARTIFACT_ACTIVATE = re.compile(
+    r"^/v1/skill-evolution/([a-z0-9_-]+)/versions/(\d+)/activate$"
+)
 WEB_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "web"))
 
 
@@ -122,9 +126,6 @@ class ApiHandler(BaseHTTPRequestHandler):
         if path == "/assets/app.js":
             self._serve_file("app.js")
             return
-        if path == "/favicon.ico":
-            self._send_json(404, {"error": "not found"})
-            return
         if path == "/health":
             self._send_json(200, {"status": "ok", "reviewer": self.service.reviewer.name,
                                   "runtime": self.service.harness.name,
@@ -142,14 +143,26 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"stats": self.service.store.dashboard_stats(principal.tenant_id),
                                   "tasks": self.service.store.list_tasks(10, principal.tenant_id),
                                   "queue": self.service.queue.backend,
-                                  "orchestrator": self.service.reviewer.name})
+                                  "orchestrator": self.service.reviewer.name,
+                                  "llm": {
+                                      "enabled": bool(self.service.llm_config),
+                                      "provider": self.service.llm_config.get("provider", "local"),
+                                      "model": self.service.llm_config.get("model", ""),
+                                  }})
             return
         if path == "/api/tasks":
             self._send_json(200, {"tasks": self.service.store.list_tasks(
                 int(query.get("limit", [50])[0]), principal.tenant_id)})
             return
         if path == "/api/skills":
-            self._send_json(200, {"skills": self.service.registry.list()})
+            self._send_json(200, {
+                "skills": self.service.list_skills(principal.tenant_id),
+                "llm": {
+                    "enabled": bool(self.service.llm_config),
+                    "provider": self.service.llm_config.get("provider", "local"),
+                    "model": self.service.llm_config.get("model", ""),
+                },
+            })
             return
         if path == "/api/failures":
             if not principal.can("audit"):
@@ -203,6 +216,32 @@ class ApiHandler(BaseHTTPRequestHandler):
             status["model"] = self.service.llm_config.get("model", "")
             self._send_json(200, status)
             return
+        if path == "/v1/skill-evolution/status":
+            if not principal.can("manage"):
+                self._send_json(403, {"error": "permission denied"})
+                return
+            skill_name = query.get("skill_name", ["evolved-review"])[0]
+            self._send_json(200, self.service.skill_evolution.status(
+                skill_name, principal.tenant_id
+            ))
+            return
+        if path == "/v1/skill-evolution/runs":
+            if not principal.can("manage"):
+                self._send_json(403, {"error": "permission denied"})
+                return
+            self._send_json(200, {"runs": self.service.store.list_skill_evolution_runs(
+                int(query.get("limit", [50])[0]), principal.tenant_id
+            )})
+            return
+        match = SKILL_ARTIFACT_VERSIONS.match(path)
+        if match:
+            if not principal.can("manage"):
+                self._send_json(403, {"error": "permission denied"})
+                return
+            self._send_json(200, {"versions": self.service.store.list_skill_artifact_versions(
+                match.group(1), principal.tenant_id
+            )})
+            return
         if path == "/github/install":
             if not self.settings.github_app_slug:
                 self._send_json(503, {"error": "SUPERCLAW_GITHUB_APP_SLUG is not configured"})
@@ -224,6 +263,19 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         report_match = REPORT.match(path)
         task_match = TASK.match(path)
+        feedback_match = FEEDBACK.match(path)
+        if feedback_match:
+            if not principal.can("review"):
+                self._send_json(403, {"error": "permission denied"})
+                return
+            task = self.service.store.get(feedback_match.group(1), principal.tenant_id)
+            if not task:
+                self._send_json(404, {"error": "task not found"})
+                return
+            self._send_json(200, {"cases": self.service.store.list_task_failure_cases(
+                feedback_match.group(1), principal.tenant_id
+            )})
+            return
         if report_match:
             task = self.service.store.get(report_match.group(1), principal.tenant_id)
             if not task or not task.get("report"):
@@ -328,10 +380,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             if match:
                 principal = self._principal("review")
                 payload = self._read_json(body)
-                self._send_json(201, self.service.record_feedback(
+                result = self.service.record_feedback(
                     match.group(1), str(payload.get("category", "")), payload.get("finding"),
                     str(payload.get("note", "")), principal.tenant_id,
-                ))
+                )
+                self.service.store.audit(
+                    principal.tenant_id, principal.username, "feedback.record", match.group(1),
+                    {"category": result["category"]},
+                )
+                self._send_json(201, result)
                 return
             match = CANCEL.match(path)
             if match:
@@ -389,9 +446,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send_json(201, result)
                 return
             if path == "/v1/evolution/auto":
-                self._principal("manage")
+                principal = self._principal("manage")
                 payload = self._read_json(body)
-                result = self.service.evolution.auto_propose(str(payload.get("skill_name", "llm-review")))
+                result = self.service.evolution.auto_propose(
+                    str(payload.get("skill_name", "llm-review")), principal.tenant_id
+                )
                 if result["decision"] == "activated":
                     self.service.reload_skills()
                 self._send_json(201, result)
@@ -406,6 +465,51 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if result["decision"] == "activated":
                     self.service.reload_skills()
                 self._send_json(201, result)
+                return
+            if path == "/v1/skill-evolution/auto":
+                principal = self._principal("manage")
+                payload = self._read_json(body)
+                result = self.service.skill_evolution.auto_propose(
+                    str(payload.get("skill_name", "evolved-review")), principal.tenant_id
+                )
+                if result["decision"] == "activated":
+                    self.service.reload_skills()
+                self.service.store.audit(
+                    principal.tenant_id, principal.username, "skill.evolution.auto",
+                    str(payload.get("skill_name", "evolved-review")),
+                    {"decision": result["decision"], "run_id": result.get("run_id")},
+                )
+                self._send_json(201, result)
+                return
+            if path == "/v1/skill-evolution/propose":
+                principal = self._principal("manage")
+                payload = self._read_json(body)
+                result = self.service.skill_evolution.propose(
+                    str(payload.get("skill_name", "")), payload.get("artifact"),
+                    principal.tenant_id,
+                )
+                if result["decision"] == "activated":
+                    self.service.reload_skills()
+                self.service.store.audit(
+                    principal.tenant_id, principal.username, "skill.evolution.propose",
+                    str(payload.get("skill_name", "")),
+                    {"decision": result["decision"], "run_id": result.get("run_id")},
+                )
+                self._send_json(201, result)
+                return
+            match = SKILL_ARTIFACT_ACTIVATE.match(path)
+            if match:
+                principal = self._principal("manage")
+                ok = self.service.skill_evolution.rollback(
+                    match.group(1), int(match.group(2)), principal.tenant_id
+                )
+                if ok:
+                    self.service.reload_skills()
+                self.service.store.audit(
+                    principal.tenant_id, principal.username, "skill.evolution.activate",
+                    match.group(1), {"version": int(match.group(2)), "activated": ok},
+                )
+                self._send_json(200 if ok else 404, {"activated": ok})
                 return
             match = ROLLBACK.match(path)
             if match:

@@ -1,6 +1,48 @@
 import os
+import re
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Iterable, Optional
+
+
+_DOTENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def load_dotenv(paths: Optional[Iterable[str]] = None) -> None:
+    """Load local dotenv files without overriding real process environment values.
+
+    The project-root file has priority over ``superclaw/.env``.  This allows the
+    latter to remain compatible with existing local setups while keeping the
+    conventional root-level ``.env`` as the recommended location.
+    """
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(package_dir)
+    candidates = list(paths) if paths is not None else [
+        os.path.join(project_root, ".env"),
+        os.path.join(package_dir, ".env"),
+    ]
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8-sig") as handle:
+                lines = handle.readlines()
+        except OSError:
+            continue
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            if "=" not in line:
+                continue
+            key, value = (part.strip() for part in line.split("=", 1))
+            if not _DOTENV_KEY.fullmatch(key):
+                continue
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+
+
+load_dotenv()
 
 
 def _int(name: str, default: int) -> int:
@@ -38,6 +80,16 @@ class Settings:
     database_url: str = ""
     redis_url: str = ""
     async_workers: int = 2
+    agent_max_workers: int = 4
+    agent_retries: int = 1
+    collaboration_rounds: int = 2
+    agent_loop_max_steps: int = 4
+    agent_loop_timeout_seconds: int = 45
+    context_max_tokens: int = 12000
+    context_reserved_tokens: int = 2500
+    memory_enabled: bool = True
+    memory_recall_limit: int = 6
+    memory_working_ttl_seconds: int = 86400
     skills_dir: str = "skills"
     github_app_id: str = ""
     github_app_slug: str = ""
@@ -166,6 +218,20 @@ class Settings:
             raise ValueError("bootstrap admin username and password must be configured together")
         if not 0.0 <= self.alert_failure_rate <= 1.0:
             raise ValueError("SUPERCLAW_ALERT_FAILURE_RATE must be between 0 and 1")
+        if self.agent_max_workers < 1:
+            raise ValueError("SUPERCLAW_AGENT_MAX_WORKERS must be at least 1")
+        if self.agent_retries < 0:
+            raise ValueError("SUPERCLAW_AGENT_RETRIES cannot be negative")
+        if self.collaboration_rounds < 1:
+            raise ValueError("SUPERCLAW_COLLABORATION_ROUNDS must be at least 1")
+        if self.agent_loop_max_steps < 1:
+            raise ValueError("SUPERCLAW_AGENT_LOOP_MAX_STEPS must be at least 1")
+        if self.context_max_tokens < 512:
+            raise ValueError("SUPERCLAW_CONTEXT_MAX_TOKENS must be at least 512")
+        if not 0 <= self.context_reserved_tokens < self.context_max_tokens:
+            raise ValueError(
+                "SUPERCLAW_CONTEXT_RESERVED_TOKENS must be smaller than the context budget"
+            )
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -185,6 +251,20 @@ class Settings:
             database_url=os.getenv("SUPERCLAW_DATABASE_URL", ""),
             redis_url=os.getenv("SUPERCLAW_REDIS_URL", ""),
             async_workers=_int("SUPERCLAW_ASYNC_WORKERS", 2),
+            agent_max_workers=_int("SUPERCLAW_AGENT_MAX_WORKERS", 4),
+            agent_retries=_non_negative_int("SUPERCLAW_AGENT_RETRIES", 1),
+            collaboration_rounds=_int("SUPERCLAW_COLLABORATION_ROUNDS", 2),
+            agent_loop_max_steps=_int("SUPERCLAW_AGENT_LOOP_MAX_STEPS", 4),
+            agent_loop_timeout_seconds=_int("SUPERCLAW_AGENT_LOOP_TIMEOUT_SECONDS", 45),
+            context_max_tokens=_int("SUPERCLAW_CONTEXT_MAX_TOKENS", 12000),
+            context_reserved_tokens=_non_negative_int(
+                "SUPERCLAW_CONTEXT_RESERVED_TOKENS", 2500
+            ),
+            memory_enabled=_bool("SUPERCLAW_MEMORY_ENABLED", True),
+            memory_recall_limit=_int("SUPERCLAW_MEMORY_RECALL_LIMIT", 6),
+            memory_working_ttl_seconds=_int(
+                "SUPERCLAW_MEMORY_WORKING_TTL_SECONDS", 86400
+            ),
             skills_dir=os.getenv("SUPERCLAW_SKILLS_DIR", "skills"),
             github_app_id=os.getenv("SUPERCLAW_GITHUB_APP_ID", ""),
             github_app_slug=os.getenv("SUPERCLAW_GITHUB_APP_SLUG", ""),

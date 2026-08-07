@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import threading
 import uuid
 from typing import Any, Callable, Dict, List, Optional
@@ -198,6 +199,7 @@ class EvolutionEngine:
     """Prompt evolution backed by replay evaluation, audit records and activation gates."""
 
     FORBIDDEN = ("ignore previous", "disable safety", "bypass", "直接执行生产")
+    FEEDBACK_RULE_ID = re.compile(r"^[A-Z][A-Z0-9_-]{1,79}$")
 
     def __init__(
         self, store, reviewer_factory: Optional[Callable[[str], object]] = None,
@@ -448,8 +450,10 @@ class EvolutionEngine:
         with self._lock:
             return self.store.activate_skill_version(skill_name, version)
 
-    def auto_propose(self, skill_name: str = "llm-review") -> Dict[str, Any]:
-        cases = self.store.list_failure_cases(True, 100)
+    def auto_propose(
+        self, skill_name: str = "llm-review", tenant_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        cases = self.store.list_failure_cases(True, 100, tenant_id)
         active = self.store.get_active_skill_version(skill_name)
         base = active["prompt"] if active else DEFAULT_PROMPT
         counts = {}
@@ -464,6 +468,24 @@ class EvolutionEngine:
             directives.append("Propose minimal fixes that preserve behavior and always include a regression test.")
         if counts.get("execution_error"):
             directives.append("Keep output valid JSON and follow the requested schema exactly.")
+        # A missed-issue feedback item may carry the reviewer rule identifier that a
+        # human confirmed.  Preserve that signal in the prompt without accepting
+        # arbitrary feedback text as an instruction.  The bracketed marker is both
+        # human-readable to an LLM and machine-auditable in offline replay.
+        learned_rule_ids = sorted({
+            str((case.get("payload", {}).get("finding") or {}).get("rule_id", "")).strip()
+            for case in cases
+            if case.get("category") == "missed_issue"
+        })
+        learned_rule_ids = [
+            rule_id for rule_id in learned_rule_ids
+            if self.FEEDBACK_RULE_ID.fullmatch(rule_id)
+        ]
+        directives.extend(
+            "Explicitly check added lines for confirmed rule %s [focus-rule:%s]."
+            % (rule_id, rule_id)
+            for rule_id in learned_rule_ids
+        )
         additions = [directive for directive in directives if directive.lower() not in base.lower()]
         if not additions:
             return {
@@ -485,6 +507,7 @@ class EvolutionEngine:
         result = self.propose(skill_name, candidate)
         result["failure_cases_used"] = len(cases)
         result["learned_categories"] = counts
+        result["learned_rule_ids"] = learned_rule_ids
         if result["decision"] == "activated":
             self.store.resolve_failure_cases([case["id"] for case in cases])
         return result

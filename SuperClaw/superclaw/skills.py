@@ -133,6 +133,11 @@ class SkillRegistry:
         with self._lock:
             return list(self._skills.values())
 
+    def unregister(self, name: str) -> None:
+        with self._lock:
+            self._skills.pop(name, None)
+            self._info.pop(name, None)
+
     def list(self) -> List[dict]:
         with self._lock:
             values = []

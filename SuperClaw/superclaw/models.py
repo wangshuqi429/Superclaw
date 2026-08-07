@@ -55,6 +55,7 @@ class ReviewReport:
     findings: List[Finding] = field(default_factory=list)
     files_reviewed: List[str] = field(default_factory=list)
     reviewer: str = "local-rules"
+    collaboration: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -65,6 +66,7 @@ class ReviewReport:
             "findings": [item.to_dict() for item in self.findings],
             "files_reviewed": self.files_reviewed,
             "reviewer": self.reviewer,
+            "collaboration": self.collaboration,
         }
 
 

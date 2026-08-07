@@ -2,21 +2,26 @@ import hashlib
 import uuid
 from typing import Any, Dict, Optional
 
-from .agents import FilteredAgent, MultiAgentCoordinator
+from .agents import MultiAgentCoordinator
 from .auth import AuthManager
-from superclaw.config import Settings
+from .config import Settings
+from .context_manager import ContextManager
 from .evolution import EvolutionEngine
 from .fixer import SafeFixer
 from .github import GitHubAppAuthenticator, GitHubClient
 from .harness import ReviewHarness
 from .metrics import metrics
+from .memory import MemoryManager
 from .models import TaskState, TraceEvent
 from .observability import AlertManager, Observability
 from .postgres_store import create_store
 from .report import to_markdown
-from .reviewer import LocalRuleReviewer, OpenAICompatibleReviewer
+from .reviewer import (
+    OpenAICompatibleReviewer, ReliabilityRuleReviewer, SecurityRuleReviewer,
+)
 from .diff_parser import parse_unified_diff
 from .skills import SkillRegistry
+from .skill_evolution import DeclarativeSkillReviewer, SkillEvolutionEngine
 from .store import utc_now
 from .task_queue import PermanentTaskError, TaskQueue
 from .rollout import ReleaseManager
@@ -29,19 +34,25 @@ class ReviewService:
         settings.validate_evolution()
         self.llm_config = settings.resolved_llm()
         self.store = create_store(settings.database_url, settings.db_path)
+        self.context_manager = ContextManager(
+            settings.context_max_tokens, settings.context_reserved_tokens
+        )
+        self.memory = MemoryManager(
+            self.store, settings.memory_enabled, settings.memory_recall_limit,
+            settings.memory_working_ttl_seconds,
+        )
         self.observability = Observability(settings.otel_service_name, settings.otel_endpoint)
         self.registry = SkillRegistry(
             settings.skills_dir, settings.skill_sandbox, settings.skill_timeout_seconds,
             settings.skill_memory_mb, settings.skill_signing_key,
             settings.skill_container_image,
         )
-        local = LocalRuleReviewer()
         self.registry.register(
-            "security-review", FilteredAgent("security-agent", local, ("SEC-",)),
+            "security-review", SecurityRuleReviewer(),
             "1.0.0", "Security, injection and secret detection",
         )
         self.registry.register(
-            "reliability-review", FilteredAgent("reliability-agent", local, ("REL-",)),
+            "reliability-review", ReliabilityRuleReviewer(),
             "1.0.0", "Reliability and observability review",
         )
         if self.llm_config:
@@ -52,7 +63,7 @@ class ReviewService:
                 "1.0.0", "Context-aware AI code review via %s" % self.llm_config["provider"],
             )
         self.registry.reload()
-        coordinator = MultiAgentCoordinator(self.registry.reviewers(), store=self.store)
+        coordinator = self._build_coordinator(self.registry.reviewers())
         self.reviewer = coordinator
         self.harness = ReviewHarness(
             self.store, self.reviewer, settings.max_steps, settings.timeout_seconds,
@@ -80,6 +91,14 @@ class ReviewService:
             min_holdout_cases=settings.eval_min_holdout_cases,
             max_metric_regression=settings.eval_max_metric_regression,
         )
+        self.skill_evolution = SkillEvolutionEngine(
+            self.store,
+            min_cases=settings.eval_min_cases,
+            max_cases=settings.eval_max_cases,
+            min_improvement=settings.eval_min_improvement,
+            min_holdout_cases=settings.eval_min_holdout_cases,
+            max_metric_regression=settings.eval_max_metric_regression,
+        )
         self.queue = TaskQueue(
             self._process_queued, settings.async_workers, settings.redis_url,
             settings.queue_max_attempts, settings.queue_lease_seconds,
@@ -97,6 +116,16 @@ class ReviewService:
             system_prompt=prompt,
             provider=str(self.llm_config["provider"]),
             extra_headers=dict(self.llm_config.get("headers") or {}),
+        )
+
+    def _build_coordinator(self, reviewers: list) -> MultiAgentCoordinator:
+        return MultiAgentCoordinator(
+            reviewers, max_workers=self.settings.agent_max_workers, store=self.store,
+            agent_retries=self.settings.agent_retries,
+            collaboration_rounds=self.settings.collaboration_rounds,
+            context_manager=self.context_manager, memory_manager=self.memory,
+            agent_loop_max_steps=self.settings.agent_loop_max_steps,
+            agent_loop_timeout_seconds=self.settings.agent_loop_timeout_seconds,
         )
 
     def _candidate_reviewer(self, tenant_id: str):
@@ -118,22 +147,32 @@ class ReviewService:
     ):
         task = self.store.get(task_id, tenant_id) or {}
         deployment = self.store.get_deployment(tenant_id, "llm-review")
+        evolved = self._active_evolved_reviewers(tenant_id)
         if (
             (task.get("input") or {}).get("release_lane") == "canary"
             or (deployment and deployment.get("status") == "promoted")
         ):
             candidate = self._candidate_reviewer(tenant_id)
             if candidate:
-                canary_reviewer = MultiAgentCoordinator([
+                canary_reviewer = self._build_coordinator([
                     item for item in self.registry.reviewers()
                     if not isinstance(item, OpenAICompatibleReviewer)
-                ] + [candidate], store=self.store)
+                ] + evolved + [candidate])
                 harness = ReviewHarness(
                     self.store, canary_reviewer, self.settings.max_steps,
                     self.settings.timeout_seconds, observability=self.observability,
                 )
-                return harness.run(task_id, repository, pull_request, diff)
-        return self.harness.run(task_id, repository, pull_request, diff)
+                return harness.run(task_id, repository, pull_request, diff, tenant_id)
+        if evolved:
+            tenant_reviewer = self._build_coordinator(
+                self.registry.reviewers() + evolved
+            )
+            harness = ReviewHarness(
+                self.store, tenant_reviewer, self.settings.max_steps,
+                self.settings.timeout_seconds, observability=self.observability,
+            )
+            return harness.run(task_id, repository, pull_request, diff, tenant_id)
+        return self.harness.run(task_id, repository, pull_request, diff, tenant_id)
 
     def _run_shadow(
         self, task_id: str, tenant_id: str, diff: str, primary_report,
@@ -191,13 +230,32 @@ class ReviewService:
                 self._build_llm_reviewer(active["prompt"] if active else ""),
                 "1.0.0", "Context-aware AI code review via %s" % self.llm_config["provider"],
             )
-        skills = self.registry.reload()
-        self.reviewer = MultiAgentCoordinator(self.registry.reviewers(), store=self.store)
+        self.registry.reload()
+        skills = self.registry.list()
+        self.reviewer = self._build_coordinator(self.registry.reviewers())
         self.harness = ReviewHarness(
             self.store, self.reviewer, self.settings.max_steps, self.settings.timeout_seconds,
             observability=self.observability,
         )
         return skills
+
+    def _active_evolved_reviewers(self, tenant_id: str) -> list:
+        return [
+            DeclarativeSkillReviewer(version["artifact"], int(version["version"]))
+            for version in self.store.list_active_skill_artifacts(tenant_id)
+        ]
+
+    def list_skills(self, tenant_id: str) -> list:
+        values = self.registry.list()
+        values.extend({
+            "name": version["skill_name"], "version": str(version["version"]),
+            "description": version["artifact"].get(
+                "description", "Replay-gated evolved skill"
+            ),
+            "source": "evolved-db", "sandboxed": True, "permissions": [],
+            "artifact_sha256": version["artifact_sha256"],
+        } for version in self.store.list_active_skill_artifacts(tenant_id))
+        return values
 
     def _validate_review(self, repository: str, diff: str) -> None:
         if not repository or len(repository) > 250:
@@ -427,11 +485,18 @@ class ReviewService:
         self, task_id: str, category: str, finding: Optional[dict], note: str,
         tenant_id: Optional[str] = None,
     ) -> dict:
-        if not self.store.get(task_id, tenant_id):
+        task = self.store.get(task_id, tenant_id)
+        if not task:
             raise ValueError("task not found")
+        if task.get("state") != "SUCCESS" or not task.get("report"):
+            raise ValueError("feedback requires a completed review task")
         if category not in {"false_positive", "missed_issue", "bad_fix", "accepted"}:
             raise ValueError("unsupported feedback category")
         self.store.record_failure_case(task_id, category, {"finding": finding, "note": note[:2000]})
+        self.memory.remember_feedback(
+            task.get("tenant_id") or tenant_id or "default", task["repository"],
+            task_id, category, finding, note[:2000],
+        )
         metrics.inc("feedback_total")
         return {"recorded": True, "category": category}
 

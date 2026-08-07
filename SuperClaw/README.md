@@ -1,9 +1,5 @@
 # Superclaw PR Reviewer
 
-Superclaw 是一个面向 Pull Request 的自进化审查与安全修复平台。它把任务生命周期、预算、失败恢复和审计放在 Harness 中，把具体能力封装为可替换的 Skill。
-
-当前支持：
-
 - 审查统一 diff，输出结构化问题、修复建议和测试建议
 - GitHub `pull_request` webhook（`opened`、`reopened`、`synchronize`）
 - OpenAI 兼容模型；未配置模型时自动使用确定性的本地规则审查器
@@ -15,7 +11,10 @@ Superclaw 是一个面向 Pull Request 的自进化审查与安全修复平台�
 - 独立分支上的保守型自动修复提交
 - PostgreSQL、Redis 生产模式
 - 失败案例回流、提示词评测、版本激活与回滚
-- LangGraph 节点编排、持久化 checkpoint 与任务断点续跑
+- 自研 Agent Runtime、持久化 checkpoint、执行预算与任务断点续跑
+- 带 Tool Registry、参数 Schema 校验和结构化 Observation 的有界 Agent Loop
+- 覆盖任务、工具、反馈、记忆、观察与 Diff 的统一 Context Window 和逐轮压缩
+- Working/Episodic/Semantic 分层记忆、租户级检索、任务归档与过期清理
 - Redis Streams ACK、Worker 租约、指数退避重试和死信队列
 - Webhook delivery 幂等、重放时间窗与评论 upsert
 - 用户登录、RBAC、租户/仓库隔离和不可变管理审计
@@ -109,6 +108,13 @@ $env:SUPERCLAW_LLM_MODEL = '<model-name>'
 
 密钥只通过环境变量读取，不要提交到仓库。
 
+项目启动时会自动读取项目根目录的 `.env`，也兼容 `superclaw/.env`；系统环境变量优先于 `.env` 文件。推荐将以下内容写入根目录 `.env`（该文件已被 `.gitignore` 忽略）：
+
+```env
+SUPERCLAW_LLM_PROVIDER=deepseek
+SUPERCLAW_DEEPSEEK_API_KEY=你的真实APIKey
+```
+
 ## 评测与提示词进化
 
 服务启动时会建立基础验证集和隐藏回归集。候选提示词不会接受调用方提供的“回归分数”作为上线依据，而是：
@@ -122,6 +128,43 @@ $env:SUPERCLAW_LLM_MODEL = '<model-name>'
 7. 所有评测运行、版本、指标和激活决定均持久化，可回滚。
 
 可通过 `POST /v1/evaluation/cases` 增加版本化样本，`split` 支持 `train`、`validation` 和 `holdout`。样本名称和内容绑定且不可覆盖；修订样本必须使用新名称，重复提交相同内容则保持幂等。期望结果可选填 `rule_id`，用于避免“同一行但错误类别”的结果被算作命中。`POST /v1/evolution/auto` 会从未解决反馈生成候选并执行同样的真实回放门禁。
+
+仓库还提供可复现的受控离线进化证明：它只从 Validation 仓库的确认漏报中提取经过格式校验的 `rule_id`，自动生成 Prompt v2，然后在仓库完全隔离的 Holdout 上回放并保存真实版本链、`evolution_runs`、数据指纹和报告：
+
+```powershell
+python scripts/run_prompt_evolution_proof.py
+```
+
+输出位于 `output/prompt-evolution-proof/`。该实验用于证明“反馈驱动的提示词版本确实改变 Agent 行为并通过隐藏集门禁”，数据来源仍是 `synthetic-controlled`，因此生产来源门禁保持失败；它不应被表述为外部 LLM 权重提升或真实公开 PR 上的生产效果。
+
+## Skill 自进化
+
+Skill 自进化与提示词进化是两套独立版本链。系统不会把反馈直接拼成 Python 执行，而是生成无主机权限的声明式 Skill artifact。artifact 可以新增确认漏报规则或移除确认误报规则，并包含父版本、内容 SHA-256、评测分数和激活状态。
+
+`POST /v1/skill-evolution/auto` 从当前租户未解决反馈生成候选。漏报反馈应携带 `finding.rule_id`、`severity`、`path` 和 `line`；系统优先使用 `finding.evidence`，缺失时从原任务 Diff 的对应新增行提取字面匹配证据。候选只有在 Validation 获得最小提升、受保护指标不退化且 Holdout 非退化时才会自动激活并解析所使用的反馈。被拒绝或样本不足的版本仍会保存供审计，但不会进入审查链路。
+
+也可以向 `POST /v1/skill-evolution/propose` 提交人工构造的候选：
+
+```json
+{
+  "skill_name": "evolved-review",
+  "artifact": {
+    "name": "evolved-review",
+    "description": "Confirmed project-specific review rules",
+    "rules": [{
+      "rule_id": "SEC-DANGEROUS-CALL",
+      "severity": "high",
+      "match": "dangerous_call(data)",
+      "title": "Dangerous call",
+      "explanation": "A confirmed unsafe API was added.",
+      "fix": "Use the constrained API.",
+      "test": "Add a regression test."
+    }]
+  }
+}
+```
+
+激活后服务会把 `evolved-review@<version>` 作为真实 specialist 加入当前租户的 `MultiAgentCoordinator`。artifact、激活版本、进化运行和运行时注入均按租户隔离；重启、`/v1/skills/reload` 和版本回滚都会从数据库恢复相应 artifact。Skill 名称必须以 `evolved-` 开头，规则只支持新增行上的受限字面匹配，不支持任意代码、正则表达式或主机权限。
 
 相关门禁可通过以下环境变量调整：
 
@@ -220,18 +263,14 @@ Invoke-RestMethod https://<公网域名>/health
 
 自动修复只覆盖可确定安全的规则，例如调试输出、`shell=True` 和硬编码 Python 凭据；结果始终提交到新的 `superclaw/fix-pr-*` 分支，不直接修改源分支。
 
-### GitHub App 安装
+## 完整生产模式
 
-在 GitHub Developer settings 创建 GitHub App：
+```powershell
+Copy-Item .env.example .env
+docker compose up --build
+```
 
-- Setup URL：`<公网地址>/github/setup`
-- Webhook URL：`<公网地址>/webhooks/github`
-- Webhook event：Pull request
-- Repository permissions：Contents `Read & write`、Pull requests `Read & write`、Metadata `Read-only`
-
-下载 App 私钥后配置 `SUPERCLAW_GITHUB_APP_ID`、`SUPERCLAW_GITHUB_APP_SLUG`、`SUPERCLAW_GITHUB_PRIVATE_KEY_PATH` 和 webhook secret。管理台的 GitHub App 页面会进入正式安装流程。
-
-自动修复只覆盖可确定安全的规则，例如调试输出、`shell=True` 和硬编码 Python 凭据；结果始终提交到新的 `superclaw/fix-pr-*` 分支，不直接修改源分支。
+Compose 会启动 PostgreSQL、Redis 和 Superclaw。未配置这两项时，项目自动退回 SQLite 与进程内线程队列，适合本地演示。
 
 ## API
 
@@ -243,6 +282,7 @@ Invoke-RestMethod https://<公网域名>/health
 | `POST` | `/v1/reviews?async=true` | 创建异步审查任务 |
 | `GET` | `/v1/tasks/{id}` | 获取状态、轨迹和报告 |
 | `GET` | `/v1/tasks/{id}/report` | 获取 Markdown 报告 |
+| `GET` | `/v1/tasks/{id}/feedback` | 获取该已完成任务的反馈历史 |
 | `POST` | `/v1/tasks/{id}/fix` | 创建自动修复分支和提交 |
 | `POST` | `/v1/tasks/{id}/feedback` | 回流误报、漏报或坏修复 |
 | `POST` | `/v1/tasks/{id}/cancel` | 请求取消任务 |
@@ -255,6 +295,12 @@ Invoke-RestMethod https://<公网域名>/health
 | `GET` | `/v1/evolution/status` | 查询模型与评测门禁就绪状态 |
 | `GET` | `/v1/evolution/runs` | 查询持久化的新旧版本评测记录 |
 | `POST` | `/v1/skills/{name}/versions/{version}/activate` | 激活或回滚版本 |
+| `POST` | `/v1/skill-evolution/auto` | 从确认反馈生成、回放并门禁 Skill 候选 |
+| `POST` | `/v1/skill-evolution/propose` | 评测指定声明式 Skill artifact |
+| `GET` | `/v1/skill-evolution/status?skill_name={name}` | 查询 Skill 门禁与激活版本 |
+| `GET` | `/v1/skill-evolution/runs` | 查询 Skill 进化运行与指标 |
+| `GET` | `/v1/skill-evolution/{name}/versions` | 查询 Skill artifact 版本链 |
+| `POST` | `/v1/skill-evolution/{name}/versions/{version}/activate` | 激活或回滚 Skill artifact |
 | `GET` | `/metrics` | Prometheus 文本指标 |
 | `GET` | `/api/alerts` | 查询租户告警 |
 | `GET` | `/api/audit` | 查询租户审计日志 |
@@ -264,3 +310,35 @@ Invoke-RestMethod https://<公网域名>/health
 
 `POST /v1/reviews` 的 `diff` 最大默认 1 MiB；单任务默认最多 8 步、120 秒。可通过环境变量调整，详见 `.env.example`。
 
+完成审查后，可在任务详情的“审查反馈”区域提交 `false_positive`、`missed_issue` 或 `bad_fix`。接口要求任务已成功完成，并会将反馈按任务、租户保存；`missed_issue` 建议附带 `finding.rule_id`、`path` 和 `line`，以便后续候选学习准确的检查目标。
+
+## 架构
+
+```text
+HTTP / GitHub Webhook
+        │
+        ▼
+ ReviewService ── TaskStore(SQLite / PostgreSQL)
+        │
+        ▼
+ ReviewHarness (Superclaw Runtime / checkpoint / resume / budget / trace)
+        │
+        ├── DiffParser
+        ├── Redis Streams / ACK / lease / retry / DLQ
+        ├── ContextManager (unified token budget / iterative context compression)
+        ├── MemoryManager (working / episodic / semantic / consolidation / expiry)
+        └── MultiAgentCoordinator
+              ├── Planner：按语言、文件和风险域分解任务
+              ├── Specialists（并行）
+              │     ├── 独立 Security Rule Agent
+              │     ├── 独立 Reliability Rule Agent
+              │     ├── OpenAI-compatible LLM Agent
+              │     └── dynamically loaded Skills
+              ├── Agent Loop：Plan / Tool / Observe / Final，带工具 Schema、步骤与时间预算
+              ├── Critic → Reflection：质疑并把修订请求交回原 Agent
+              ├── Evidence Agent：独立复核新增行证据
+              ├── Verifier：执行置信度、证据和修复安全门禁
+              └── Arbiter：合并冲突并裁决最终 findings
+```
+
+Harness 由项目内 `AgentRuntime` 控制状态流转：`PENDING → PLANNING → EXECUTING → REVIEWING → SUCCESS`。LLM Specialist 在有界 Agent Loop 中依据 Tool Registry 暴露的参数 Schema 选择 Diff 搜索、变更行读取、文件列表和记忆检索工具；Runtime 在调用前校验参数，并把结果或错误写成结构化 Observation。ContextManager 每轮重新组合任务、工具 Schema、Critic 反馈、历史记忆、最新 Observation 与风险排序后的 Diff，共享统一 Token 预算。MemoryManager 按租户与仓库检索历史经验，任务结束后把裁决摘要归档为 Episodic Memory、释放 Working Memory，并在 Recall 前清理过期记录。步骤和时间预算耗尽后，Agent 进入既有重试/交接流程。协作协议仍为 `规划 → 初审 → 质疑 → 反思/补证 → 验证 → 裁决`，消息、工具观察、重试、任务交接和最终裁决均随任务持久化。
